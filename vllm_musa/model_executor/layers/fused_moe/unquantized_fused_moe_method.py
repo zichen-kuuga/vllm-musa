@@ -1,3 +1,5 @@
+import inspect
+
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -21,6 +23,11 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 
 logger = init_logger(__name__)
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+
+
+_FUSED_EXPERTS_ACCEPTS_SHARED_EXPERTS = (
+    "shared_experts" in inspect.signature(fused_experts).parameters
+)
 
 
 @UnquantizedFusedMoEMethod.register_oot
@@ -75,20 +82,26 @@ class MusaUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         is_inplace = not is_torch_equal_or_newer("2.9")
-        result = fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=is_inplace,
-            activation=layer.activation,
-            quant_config=self.moe_quant_config,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            shared_experts=shared_experts,
-            shared_experts_input=shared_experts_input,
-        )
+        fused_experts_kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "inplace": is_inplace,
+            "activation": layer.activation,
+            "quant_config": self.moe_quant_config,
+            "apply_router_weight_on_input": layer.apply_router_weight_on_input,
+            "global_num_experts": layer.global_num_experts,
+            "expert_map": layer.expert_map,
+        }
+        if _FUSED_EXPERTS_ACCEPTS_SHARED_EXPERTS:
+            fused_experts_kwargs.update(
+                {
+                    "shared_experts": shared_experts,
+                    "shared_experts_input": shared_experts_input,
+                }
+            )
+        result = fused_experts(**fused_experts_kwargs)
 
         return result
