@@ -9,6 +9,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import get_tma_aligned_size, is_deep_gemm_e8m0_used
 
+from vllm_musa.utils.environ import envs
+
 
 def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     exp_bits = scale.view(torch.uint8).to(torch.int32)
@@ -28,6 +30,49 @@ def deepgemm_post_process_fp8_weight_block(
     if e8m0_dtype is not None and ws.dtype == e8m0_dtype and not use_e8m0:
         return wq, _upcast_e8m0_to_fp32(ws)
     return wq, ws
+
+
+def _can_use_musa_jit_per_token_group_quant_fp8(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    dtype: torch.dtype,
+    column_major_scales: bool,
+    tma_aligned_scales: bool,
+    use_ue8m0: bool,
+) -> bool:
+    return (
+        envs.VLLM_MUSA_ENABLE_JIT_PER_TOKEN_GROUP_QUANT_FP8.get()
+        and current_platform.is_musa()
+        and x.device.type == "musa"
+        and x.dim() == 2
+        and x.is_contiguous()
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and dtype == current_platform.fp8_dtype()
+        and x_q.device == x.device
+        and x_q.shape == x.shape
+        and x_q.dtype == dtype
+        and x_q.is_contiguous()
+        and x_s.device == x.device
+        and x_s.shape == (x.shape[0], x.shape[1] // group_size)
+        and x_s.dtype == torch.float32
+        and x_s.is_contiguous()
+        and group_size in (16, 32, 64, 128)
+        and abs(float(eps) - 1e-10) < 1e-13
+        and not column_major_scales
+        and not tma_aligned_scales
+        and not use_ue8m0
+    )
+
+
+def _maybe_import_musa_jit_quant():
+    try:
+        from vllm_musa.jit_kernel.csrc.quant import per_token_group_quant_8bit
+    except (ImportError, ModuleNotFoundError):
+        return None
+    return per_token_group_quant_8bit
 
 
 def per_token_group_quant_fp8(
@@ -107,6 +152,30 @@ def per_token_group_quant_fp8(
                 f"Got tensor with {x.dim()} dimensions, shape={x.shape}"
             )
         x_kernel = x if x.is_contiguous() else x.contiguous()
+
+        if _can_use_musa_jit_per_token_group_quant_fp8(
+            x_kernel,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            dtype,
+            column_major_scales,
+            tma_aligned_scales,
+            use_ue8m0,
+        ):
+            musa_jit_quant = _maybe_import_musa_jit_quant()
+            if musa_jit_quant is not None:
+                musa_jit_quant(
+                    x_kernel,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                )
+                return x_q, x_s.contiguous()
 
         torch.ops._C_musa_ops.per_token_group_fp8_quant(
             x_kernel,
