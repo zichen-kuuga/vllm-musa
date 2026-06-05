@@ -94,6 +94,7 @@ def test_csrc_rmsnorm_kernels_match_reference(dtype: torch.dtype) -> None:
 
 
 def test_csrc_per_token_group_quant_fp8_matches_native_op() -> None:
+    import vllm_musa._custom_ops  # noqa: F401
     from vllm_musa.jit_kernel.csrc.quant import per_token_group_quant_8bit
 
     torch.manual_seed(456)
@@ -189,7 +190,12 @@ def test_csrc_topk_kernels_match_reference(
     rows = 7
     experts = 128
     topk = 8
-    gating = torch.randn((rows, experts), device=device, dtype=dtype)
+    values = torch.linspace(-4.0, 4.0, experts, device=device, dtype=torch.float32)
+    perm = torch.randperm(experts, device=device)
+    base = torch.empty((experts,), device=device, dtype=torch.float32)
+    base[perm] = values
+    row_offsets = torch.arange(rows, device=device, dtype=torch.float32).unsqueeze(1)
+    gating = (base.unsqueeze(0) + row_offsets * 0.001).to(dtype)
     bias = torch.randn((experts,), device=device, dtype=torch.float32) * 0.01
 
     weights = torch.empty((rows, topk), device=device, dtype=torch.float32)
