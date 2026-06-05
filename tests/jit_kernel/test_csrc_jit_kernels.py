@@ -147,7 +147,8 @@ def _topk_softmax_ref(
     if correction_bias is not None:
         logits = logits + correction_bias.float().unsqueeze(0)
     scores = torch.softmax(logits, dim=-1)
-    values, ids = torch.topk(scores, topk, dim=-1)
+    _, ids = torch.topk(logits, topk, dim=-1)
+    values = scores.gather(1, ids)
     if renormalize:
         values = values / values.sum(dim=-1, keepdim=True)
     return values.float(), ids.int()
