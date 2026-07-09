@@ -96,3 +96,46 @@ direct_register_custom_op(
     mutates_args=["out"],
     fake_impl=_rmsnorm_custom_fake,
 )
+
+
+def fused_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    gemma: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    torch.ops.vllm.musa_csrc_fused_add_rmsnorm(
+        input, residual, weight, float(eps), bool(gemma)
+    )
+    return input, residual
+
+
+def _fused_add_rmsnorm_custom(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma: bool,
+) -> None:
+    _norm_module().sgl_musa_fused_add_rmsnorm(
+        input, residual, weight, float(eps), bool(gemma)
+    )
+
+
+def _fused_add_rmsnorm_custom_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma: bool,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="musa_csrc_fused_add_rmsnorm",
+    op_func=_fused_add_rmsnorm_custom,
+    mutates_args=["input", "residual"],
+    fake_impl=_fused_add_rmsnorm_custom_fake,
+)

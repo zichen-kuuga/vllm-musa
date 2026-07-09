@@ -64,6 +64,33 @@ def _can_use_musa_jit_rmsnorm(
     )
 
 
+def _can_use_musa_jit_fused_add_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    hidden_size = x.shape[-1]
+    return (
+        x.device.type == "musa"
+        and residual.device.type == "musa"
+        and weight.device.type == "musa"
+        and x.dim() == 2
+        and residual.dim() == 2
+        and weight.dim() == 1
+        and hidden_size > 0
+        and hidden_size == weight.numel()
+        and hidden_size % 8 == 0
+        and hidden_size <= 32768
+        and x.shape == residual.shape
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and residual.dtype == x.dtype
+        and weight.dtype == x.dtype
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
 def _musa_fused_add_rmsnorm(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -73,6 +100,8 @@ def _musa_fused_add_rmsnorm(
     if _can_use_musa_fused_add_rms_norm(x, residual, weight):
         musa_ops.musa_fused_add_rms_norm(x, residual, weight, eps)
         return x, residual
+    if _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight):
+        return musa_jit_norm.fused_add_rmsnorm(x, residual, weight, eps, gemma=False)
     if fused_add_rms_norm is not None:
         return fused_add_rms_norm(x, residual, weight, eps)
     return None
@@ -116,11 +145,17 @@ class MusaGemmaRMSNorm(GemmaRMSNorm):
         if (
             envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
             or getattr(self, "variance_size_override", None) is not None
-            or residual is not None
         ):
             return self.forward_native(x, residual)
 
         weight = self.weight.data
+        if residual is not None:
+            if _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight):
+                return musa_jit_norm.fused_add_rmsnorm(
+                    x, residual, weight, self.variance_epsilon, gemma=True
+                )
+            return self.forward_native(x, residual)
+
         if _can_use_musa_jit_rmsnorm(x, weight):
             return musa_jit_norm.gemma_rmsnorm(x, weight, self.variance_epsilon)
 
