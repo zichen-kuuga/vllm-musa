@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
 Date: Tue, 14 Jul 2026 14:30:00 +0800
-Subject: [PATCH] MUSA(model): fold the Qwen3.5 shared expert into fused_moe and
- fuse QK-RMSNorm + MRoPE
+Subject: [PATCH] MUSA(model): fold the Qwen3.5 shared expert into fused_moe
+ and  fuse QK-RMSNorm + MRoPE
 
 On MUSA the Qwen3.5/Qwen3.6 shared expert runs as a separate serial MLP because
 the shared-expert overlap stream is unavailable, adding per-layer kernels to the
@@ -19,14 +19,12 @@ through the MUSA fused QK-RMSNorm + MRoPE kernel instead, keeping the eager path
 the fallback. The rotary cache is converted to the activation dtype once and shared
 across layers: get_rope() hands every layer the same module, and the cache is
 hundreds of MB on long-context models.
-
-VLLM_MUSA_FUSED_QK_MROPE=0 restores the eager rotary path.
 ---
- vllm/model_executor/models/qwen3_next.py | 99 +++++++++++++++++++++++-
- 1 file changed, 98 insertions(+), 1 deletion(-)
+ vllm/model_executor/models/qwen3_next.py | 96 +++++++++++++++++++++++-
+ 1 file changed, 95 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index acce2a7..d70f930 100644
+index acce2a7..48857dd 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
 @@ -2,6 +2,7 @@
@@ -37,12 +35,10 @@ index acce2a7..d70f930 100644
  from collections.abc import Iterable
  from itertools import islice
 
-@@ -87,6 +88,31 @@ logger = init_logger(__name__)
-
+@@ -88,6 +89,30 @@ logger = init_logger(__name__)
  KVCache = tuple[torch.Tensor, torch.Tensor]
 
-+MUSA_FUSED_QK_MROPE_ENV = "VLLM_MUSA_FUSED_QK_MROPE"
-+
+
 +
 +
 +_MUSA_MROPE_COS_SIN_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
@@ -66,10 +62,11 @@ index acce2a7..d70f930 100644
 +    return converted
 +
 +
-
++
  class Qwen3NextSparseMoeBlock(nn.Module):
      def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
-@@ -159,8 +185,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+         super().__init__()
+@@ -159,8 +184,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                  prefix=f"{prefix}.shared_expert",
              )
 
@@ -89,7 +86,7 @@ index acce2a7..d70f930 100644
              gate=self.gate,
              num_experts=self.n_routed_experts,
              top_k=config.num_experts_per_tok,
-@@ -178,6 +214,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -178,6 +213,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              else None,
          )
 
@@ -101,7 +98,7 @@ index acce2a7..d70f930 100644
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
          # NOTE: hidden_states can have either 1D or 2D shape.
          orig_shape = hidden_states.shape
-@@ -308,6 +349,29 @@ class Qwen3NextAttention(nn.Module):
+@@ -308,6 +348,27 @@ class Qwen3NextAttention(nn.Module):
              and text_only
          )
 
@@ -112,8 +109,6 @@ index acce2a7..d70f930 100644
 +        self._musa_fused_qk_mrope = (
 +            self.attn_output_gate
 +            and current_platform.is_musa()
-+            and os.environ.get(MUSA_FUSED_QK_MROPE_ENV, "1").strip().lower()
-+            not in ("0", "false", "off", "no")
 +            and mrope_section is not None
 +            and len(mrope_section) == 3
 +            and getattr(self.rotary_emb, "mrope_interleaved", False)
@@ -131,7 +126,7 @@ index acce2a7..d70f930 100644
      def _project_qkv_gate(
          self,
          qkv: torch.Tensor,
-@@ -342,6 +406,39 @@ class Qwen3NextAttention(nn.Module):
+@@ -342,6 +403,39 @@ class Qwen3NextAttention(nn.Module):
              )
              return q, k, v, gate
 
