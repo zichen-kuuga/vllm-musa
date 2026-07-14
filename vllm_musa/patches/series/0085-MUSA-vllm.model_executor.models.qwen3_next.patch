@@ -6,11 +6,15 @@ Subject: [PATCH] MUSA(model): fold the Qwen3.5 shared expert into fused_moe
 
 On MUSA the Qwen3.5/Qwen3.6 shared expert runs as a separate serial MLP because
 the shared-expert overlap stream is unavailable, adding per-layer kernels to the
-decode path. When unquantized and the shared and routed intermediate sizes
-match, pass no shared expert to FusedMoE and stash the shared MLP and its gate
-on the routed-experts layer; the MUSA unquantized MoE method then folds the
-shared expert into the routed grouped GEMM as one extra always-selected slot,
-producing numerically equivalent output from a single kernel.
+decode path. When the shared and routed intermediate sizes match and the shared
+expert's projections carry a weight format the routed expert stack can absorb
+(unquantized, or FP8 with the [128, 128] block scales the grouped GEMM expects),
+pass no shared expert to FusedMoE and stash the shared MLP and its gate on the
+routed-experts layer; the MUSA MoE method then folds the shared expert into the
+routed grouped GEMM as one extra always-selected slot, producing numerically
+equivalent output from a single kernel. The fold appends one expert to the routed
+stack, so it is disabled under expert parallelism and EPLB, where the routed
+expert_map is built for the unfolded count.
 
 Interleaved-MRoPE models additionally fall back to the eager rotary path, because
 upstream's fused QK-norm+RoPE kernel is NeoX/text-only, so _project_qkv_gate
@@ -19,12 +23,14 @@ through the MUSA fused QK-RMSNorm + MRoPE kernel instead, keeping the eager path
 the fallback. The rotary cache is converted to the activation dtype once and shared
 across layers: get_rope() hands every layer the same module, and the cache is
 hundreds of MB on long-context models.
+
+VLLM_MUSA_MOE_SHARED_EXPERT_FUSION=0 keeps the shared expert as a separate MLP.
 ---
- vllm/model_executor/models/qwen3_next.py | 96 +++++++++++++++++++++++-
- 1 file changed, 95 insertions(+), 1 deletion(-)
+ vllm/model_executor/models/qwen3_next.py | 134 ++++++++++++++++++++++-
+ 1 file changed, 133 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index acce2a7..48857dd 100644
+index acce2a7..64ba963 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
 @@ -2,6 +2,7 @@
@@ -35,10 +41,23 @@ index acce2a7..48857dd 100644
  from collections.abc import Iterable
  from itertools import islice
 
-@@ -88,6 +89,30 @@ logger = init_logger(__name__)
+@@ -87,6 +88,62 @@ logger = init_logger(__name__)
+
  KVCache = tuple[torch.Tensor, torch.Tensor]
 
-
++MUSA_SHARED_EXPERT_FUSION_ENV = "VLLM_MUSA_MOE_SHARED_EXPERT_FUSION"
++
++
++def _musa_linear_is_block_fp8(linear: nn.Module) -> bool:
++    method = getattr(linear, "quant_method", None)
++    if method is None or not getattr(method, "block_quant", False):
++        return False
++    block_size = getattr(method, "weight_block_size", None)
++    if block_size is None:
++        block_size = getattr(
++            getattr(method, "quant_config", None), "weight_block_size", None
++        )
++    return list(block_size or []) == [128, 128]
 +
 +
 +_MUSA_MROPE_COS_SIN_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
@@ -62,22 +81,47 @@ index acce2a7..48857dd 100644
 +    return converted
 +
 +
++def _musa_shared_expert_foldable(shared_expert: nn.Module | None) -> bool:
++    """Whether the shared expert's weights can join the routed expert stack.
 +
++    Foldable when the shared MLP's projections carry the same weight format as
++    the routed experts: unquantized, or FP8 with the [128, 128] block scales the
++    grouped GEMM expects.
++    """
++    if shared_expert is None:
++        return False
++    gate_up = getattr(shared_expert, "gate_up_proj", None)
++    down = getattr(shared_expert, "down_proj", None)
++    if gate_up is None or down is None:
++        return False
++    unquantized = [
++        type(getattr(proj, "quant_method", None)).__name__ for proj in (gate_up, down)
++    ] == ["UnquantizedLinearMethod"] * 2
++    return unquantized or (
++        _musa_linear_is_block_fp8(gate_up) and _musa_linear_is_block_fp8(down)
++    )
++
+
  class Qwen3NextSparseMoeBlock(nn.Module):
      def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
-         super().__init__()
-@@ -159,8 +184,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -159,8 +216,24 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                  prefix=f"{prefix}.shared_expert",
              )
 
 +        # MUSA: fold the shared expert into the routed grouped GEMM as one extra
 +        # always-selected slot instead of running it as a separate serial MLP.
-+        # Only when unquantized and the shared/routed intermediate sizes match.
++        # Needs matching shared/routed intermediate sizes and a shared expert
++        # whose weight format the routed expert stack can absorb.
++        # The fold appends one expert to the routed stack, which an expert-parallel
++        # expert_map (built for the unfolded count) would not know about.
 +        self._musa_shared_fold = (
-+            self.shared_expert is not None
-+            and quant_config is None
++            getattr(torch.version, "musa", None) is not None
++            and os.environ.get(MUSA_SHARED_EXPERT_FUSION_ENV, "1").strip().lower()
++            not in ("0", "false", "off", "no")
++            and self.ep_size <= 1
++            and not self.enable_eplb
 +            and config.shared_expert_intermediate_size == config.moe_intermediate_size
-+            and getattr(torch.version, "musa", None) is not None
++            and _musa_shared_expert_foldable(self.shared_expert)
 +        )
 +
          self.experts = FusedMoE(
@@ -86,7 +130,7 @@ index acce2a7..48857dd 100644
              gate=self.gate,
              num_experts=self.n_routed_experts,
              top_k=config.num_experts_per_tok,
-@@ -178,6 +213,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -178,6 +251,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              else None,
          )
 
@@ -98,7 +142,7 @@ index acce2a7..48857dd 100644
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
          # NOTE: hidden_states can have either 1D or 2D shape.
          orig_shape = hidden_states.shape
-@@ -308,6 +348,27 @@ class Qwen3NextAttention(nn.Module):
+@@ -308,6 +386,27 @@ class Qwen3NextAttention(nn.Module):
              and text_only
          )
 
@@ -126,7 +170,7 @@ index acce2a7..48857dd 100644
      def _project_qkv_gate(
          self,
          qkv: torch.Tensor,
-@@ -342,6 +403,39 @@ class Qwen3NextAttention(nn.Module):
+@@ -342,6 +441,39 @@ class Qwen3NextAttention(nn.Module):
              )
              return q, k, v, gate
 
