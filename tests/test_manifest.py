@@ -110,6 +110,7 @@ def test_cat6_object_patches(manifest):
         "torch___inductor__config",
         "vllm__compilation__backends",
         "vllm__compilation__compiler_interface",
+        "vllm__utils__torch_utils",
         "vllm___custom_ops",
         "torch___inductor__aot_cache_safelist",
     }

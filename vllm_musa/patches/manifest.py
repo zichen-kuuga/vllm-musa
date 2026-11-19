@@ -551,6 +551,22 @@ def _module_entries() -> list:
     return out
 
 
+_CAT6.append(
+    DivSpec(
+        id="vllm__utils__torch_utils",
+        category="6",
+        path="vllm_musa/patches/vllm__utils__torch_utils.patch.py",
+        upstream_path="vllm/utils/torch_utils.py",
+        apply_phase="runtime",
+        required=False,
+        intent=(
+            "reuse pinned staging and destination buffers for the per-step "
+            "query_start_loc / idx_mapping H2D uploads"
+        ),
+    )
+)
+
+
 ENTRIES: list[DivSpec] = _series_entries() + _module_entries() + _CAT6
 
 
