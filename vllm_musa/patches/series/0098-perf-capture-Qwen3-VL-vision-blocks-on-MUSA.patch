@@ -4,8 +4,8 @@ Date: Tue, 27 Oct 2026 10:43:08 +0800
 Subject: [PATCH] perf: capture Qwen3-VL vision blocks on MUSA
 
 ---
- vllm/model_executor/models/qwen3_vl.py | 225 +++++++++++++++++++++++++
- 1 file changed, 225 insertions(+)
+ vllm/model_executor/models/qwen3_vl.py | 218 ++++++++++++++++++++
+ 1 file changed, 218 insertions(+)
 
 diff --git a/vllm/model_executor/models/qwen3_vl.py b/vllm/model_executor/models/qwen3_vl.py
 index 527e2b0f3e..534342a348 100644
@@ -19,15 +19,7 @@ index 527e2b0f3e..534342a348 100644
  from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
  from functools import lru_cache, partial
  from itertools import islice
-@@ -48,6 +49,7 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
- )
- from transformers.video_utils import VideoMetadata
- 
-+from vllm.compilation import monitor as compilation_monitor
- from vllm.compilation.decorators import (
-     should_torch_compile_mm_encoder,
-     support_torch_compile,
-@@ -506,6 +508,218 @@ class Qwen3_VisionBlock(nn.Module):
+@@ -506,6 +507,212 @@
          return x
  
  
@@ -64,13 +56,6 @@ index 527e2b0f3e..534342a348 100644
 +    def _is_current_stream_capturing() -> bool:
 +        try:
 +            return bool(torch.cuda.is_current_stream_capturing())
-+        except Exception:
-+            return False
-+
-+    @staticmethod
-+    def _is_outer_cudagraph_capture_active() -> bool:
-+        try:
-+            return bool(compilation_monitor.cudagraph_capturing_enabled)
 +        except Exception:
 +            return False
 +
@@ -217,7 +202,8 @@ index 527e2b0f3e..534342a348 100644
 +            self.disabled
 +            or not self.enabled()
 +            or not self._is_musa_runtime()
-+            or self._is_outer_cudagraph_capture_active()
++            # No outer-capture check here: monitor.cudagraph_capturing_enabled is
++            # a permission flag (default True), not live capture state.
 +            or self._is_current_stream_capturing()
 +        ):
 +            return None
@@ -246,7 +232,7 @@ index 527e2b0f3e..534342a348 100644
  class Qwen3_VisionPatchMerger(nn.Module):
      def __init__(
          self,
-@@ -675,6 +889,7 @@ class Qwen3_VisionTransformer(nn.Module):
+@@ -675,6 +882,7 @@
                  for layer_idx in range(vision_config.depth)
              ]
          )
@@ -254,7 +240,7 @@ index 527e2b0f3e..534342a348 100644
  
      @property
      def dtype(self) -> torch.dtype:
-@@ -880,6 +1095,16 @@ class Qwen3_VisionTransformer(nn.Module):
+@@ -880,6 +1088,16 @@
  
          pos_embeds = encoder_metadata["pos_embeds"]
          hidden_states = hidden_states + pos_embeds
